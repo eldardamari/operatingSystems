@@ -88,3 +88,10 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+//3.4
+int
+sys_cowfork(void)
+{
+  return cowfork();
+}

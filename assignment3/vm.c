@@ -6,10 +6,18 @@
 #include "mmu.h"
 #include "proc.h"
 #include "elf.h"
+#include "spinlock.h"
 
 extern char data[];  // defined by kernel.ld
 pde_t *kpgdir;  // for use in scheduler()
 struct segdesc gdt[NSEGS];
+
+//3.4
+int allPhysPageSize = PHYSTOP / PGSIZE;
+struct{
+    struct spinlock lock;
+    int pageCounter[PHYSTOP/PGSIZE];
+}counterStruct;
 
 // Set up CPU's kernel segment descriptors.
 // Run once on entry on each CPU.
@@ -37,6 +45,13 @@ seginit(void)
   // Initialize cpu-local storage.
   cpu = c;
   proc = 0;
+
+  //3.4
+  int i;
+  initlock(&counterStruct.lock, "init_counter_lock"); // lock in counter struct
+
+  for(i = 0; i < allPhysPageSize; i++) // init all array to zero pages 
+      counterStruct.pageCounter[i] = 0;
 }
 
 // Return the address of the PTE in page table pgdir
@@ -193,34 +208,34 @@ inituvm(pde_t *pgdir, char *init, uint sz)
 
 // Load a program segment into pgdir.  addr must be page-aligned
 // and the pages from addr to addr+sz must already be mapped.
-    int //3.3 - signature
-loaduvm(pde_t *pgdir, char *addr, struct inode *ip, 
-        uint offset, uint sz,int flagWriteELF)
+// 3.3
+int
+loaduvm(pde_t *pgdir, char *addr, struct inode *ip, uint offset, 
+        uint sz,uint flagWriteELF) //
 {
-    uint i, pa, n;
-    pte_t *pte;
+  uint i, pa, n;
+  pte_t *pte;
 
-    /*if((uint) addr % PGSIZE != 0)                   //3.3
-      panic("loaduvm: addr must be page aligned");*/
-    for(i = 0; i < sz; i += PGSIZE){
-        if((pte = walkpgdir(pgdir, addr+i, 0)) == 0)
-            panic("loaduvm: address should exist");
-        /**pte = *pte & ~PTE_W; //3.3 | ~ logical not<]*/
-
-        /*pa = PTE_ADDR(*pte);*/
-
-        /*pa = PTE_ADDR(*pte) + ((uint)(addr)); //3.3<]*/
-
-        pa = PTE_ADDR(*pte) + ((uint)(addr) % PGSIZE); //3.3
-
-        if(sz - i < PGSIZE)
-            n = sz - i;
-        else
-            n = PGSIZE;
-        if(readi(ip, p2v(pa), offset+i, n) != n)
-            return -1;
+  for(i = 0; i < sz; i += PGSIZE){
+    if((pte = walkpgdir(pgdir, addr+i, 0)) == 0)
+      panic("loaduvm: address should exist");
+    
+    if( flagWriteELF == 0 ) { //3.3
+    	*pte = *pte & ~PTE_W ; 
+    } else {
+        *pte = *pte | PTE_W ;
     }
-    return 0;
+
+    pa = PTE_ADDR(*pte) + ((uint)addr % PGSIZE);
+
+    if(sz - i < PGSIZE)
+      n = sz - i;
+    else
+      n = PGSIZE;
+    if(readi(ip, p2v(pa), offset+i, n) != n)
+      return -1;
+  }
+  return 0;
 }
 
 // Allocate page tables and physical memory to grow process from oldsz to
@@ -250,34 +265,123 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
   return newsz;
 }
 
-// Deallocate user pages to bring the process size from oldsz to
+// 3.4 Deallocate user pages to bring the process size from oldsz to
 // newsz.  oldsz and newsz need not be page-aligned, nor does newsz
 // need to be less than oldsz.  oldsz can be larger than the actual
 // process size.  Returns the new process size.
 int
 deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 {
-  pte_t *pte;
-  uint a, pa;
+    pte_t *pte;
+    uint a, pa;
 
-  if(newsz >= oldsz)
-    return oldsz;
+    if(newsz >= oldsz)
+        return oldsz;
 
-  a = PGROUNDUP(newsz);
-  for(; a  < oldsz; a += PGSIZE){
-    pte = walkpgdir(pgdir, (char*)a, 0);
-    if(!pte)
-      a += (NPTENTRIES - 1) * PGSIZE;
-    else if((*pte & PTE_P) != 0){
-      pa = PTE_ADDR(*pte);
-      if(pa == 0)
-        panic("kfree");
-      char *v = p2v(pa);
-      kfree(v);
-      *pte = 0;
+    a = PGROUNDUP(newsz);
+    for(; a  < oldsz; a += PGSIZE){
+        pte = walkpgdir(pgdir, (char*)a, 0);
+        if(!pte)
+            a += (NPTENTRIES - 1) * PGSIZE;
+
+        else if((*pte & PTE_P) != 0) {
+            pa = PTE_ADDR(*pte);
+
+            acquire(&counterStruct.lock);
+
+            if(counterStruct.pageCounter[pa/PGSIZE] == 1) {
+                counterStruct.pageCounter[pa/PGSIZE] = 0;
+                release(&counterStruct.lock);
+                if(pa == 0)
+                    panic("kfree");
+                char *v = p2v(pa);
+                kfree(v);
+                *pte = 0;
+            } else {
+                if(counterStruct.pageCounter[pa/PGSIZE] == 0) {
+                    if(pa == 0)
+                        panic("kfree");
+                    char *v = p2v(pa);
+                    kfree(v);
+                    *pte = 0;
+                    release(&counterStruct.lock);
+                    return newsz;
+                } else {
+                    counterStruct.pageCounter[pa/PGSIZE]--;
+                    if(counterStruct.pageCounter[pa/PGSIZE] == 1) {
+                        if((*pte & PTE_SHARED) != 0) {
+                            *pte = *pte & ~PTE_SHARED;
+                            *pte = *pte | PTE_W ;
+                        }
+                    }
+                }
+                    release(&counterStruct.lock);
+            }
+
+            // 3.4
+            // True - only one page is pointed need to free page
+
+
+            /*if( (*pte & PTE_SHARED) ) { //TODO
+                if(removePageFromCounter(pa,pte)) { 
+                    if(pa == 0)
+                        panic("kfree");
+                    char *v = p2v(pa);
+                    kfree(v);
+                    *pte = 0;
+                }
+            } else {
+                if(pa == 0)
+                    panic("kfree");
+                char *v = p2v(pa);
+                kfree(v);
+                *pte = 0;
+            }*/
+        }
     }
-  }
-  return newsz;
+    return newsz;
+}
+
+// 3.4 get pa in remove from page counter struct
+// True - only onw page in counter
+int 
+removePageFromCounter(uint pa,pte_t* pte)
+{
+    acquire(&counterStruct.lock);
+
+    int pageIndex = pa / PGSIZE;
+    int *pce = &(counterStruct.pageCounter[pageIndex]);
+
+    switch((*pce)) {
+
+        case 0: 
+            panic("Error: removePageFromCounter(); counter entry is 0"); 
+            release(&counterStruct.lock);
+            break;
+        
+        case 1:  // will kfree page for shizel!
+            (*pce) = 0;
+            release(&counterStruct.lock);
+            return 1;
+            break;
+
+        case 2: 
+            (*pce) = (*pce) - 1;
+            if((*pte & PTE_SHARED) != 0) {
+                (*pte) = (*pte) & PTE_SHARED; //TODO
+                (*pte) = (*pte) | PTE_W;
+            }
+            release(&counterStruct.lock);
+            return 0;
+            break;
+
+        default:
+            (*pce) = (*pce) - 1;
+            release(&counterStruct.lock);
+            return 0;
+            break;
+    }
+    return 0;
 }
 
 // Free a page table and all the physical memory pages
@@ -285,18 +389,18 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 void
 freevm(pde_t *pgdir)
 {
-  uint i;
+    uint i;
 
-  if(pgdir == 0)
-    panic("freevm: no pgdir");
-  deallocuvm(pgdir, KERNBASE, 0);
-  for(i = 0; i < NPDENTRIES; i++){
-    if(pgdir[i] & PTE_P){
-      char * v = p2v(PTE_ADDR(pgdir[i]));
-      kfree(v);
+    if(pgdir == 0)
+        panic("freevm: no pgdir");
+    deallocuvm(pgdir, KERNBASE, 0);
+    for(i = 0; i < NPDENTRIES; i++){
+        if(pgdir[i] & PTE_P){
+            char * v = p2v(PTE_ADDR(pgdir[i]));
+            kfree(v);
+        }
     }
-  }
-  kfree((char*)pgdir);
+    kfree((char*)pgdir);
 }
 
 // Clear PTE_U on a page. Used to create an inaccessible
@@ -324,8 +428,7 @@ copyuvm(pde_t *pgdir, uint sz)
 
   if((d = setupkvm()) == 0)
     return 0;
-  /*for(i = 0; i < sz; i += PGSIZE){ // 3.1*/
-  for(i = PGSIZE; i < sz; i += PGSIZE){ // 3.1
+  for(i = PGSIZE; i < sz; i += PGSIZE){
     if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
       panic("copyuvm: pte should exist");
     if(!(*pte & PTE_P))
@@ -334,15 +437,13 @@ copyuvm(pde_t *pgdir, uint sz)
     if((mem = kalloc()) == 0)
       goto bad;
     memmove(mem, (char*)p2v(pa), PGSIZE);
-
-    // 3.3 checking if father while fork had PTE_W set
-    /*if(mappages(d, (void*)i, PGSIZE, v2p(mem), PTE_W|PTE_U) < 0)*/
-    if((*pte & PTE_W) != 0) {
-        if(mappages(d, (void*)i, PGSIZE, v2p(mem), PTE_W|PTE_U) < 0)
-            goto bad; //3.3
+   //3.3 
+    if( (*pte & PTE_W )!= 0 ) {
+    	if(mappages(d, (void*)i, PGSIZE, v2p(mem), PTE_W|PTE_U) < 0)
+    		goto bad;
     } else {
         if(mappages(d, (void*)i, PGSIZE, v2p(mem), PTE_U) < 0)
-            goto bad; //3.3
+        	goto bad;
     }
   }
   return d;
@@ -393,44 +494,114 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
   return 0;
 }
 
-// 3.4 copyuvm for cowfork Given a parent process's page table, 
-// create a copy of it for a child.
+// 3.4
 pde_t*
-copyuvm_cowfork(pde_t *pgdir, uint sz)
+copyuvm_cow(pde_t *pgdir, uint sz)
 {
   pde_t *d;
   pte_t *pte;
   uint pa, i;
-  char *mem;
 
   if((d = setupkvm()) == 0)
     return 0;
-  /*for(i = 0; i < sz; i += PGSIZE){ // 3.1*/
-  for(i = PGSIZE; i < sz; i += PGSIZE){ // 3.1
+
+  for(i = PGSIZE; i < sz; i += PGSIZE) {
     if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
-      panic("copyuvm: pte should exist");
+      panic("cowcopyuvm: pte should exist");
     if(!(*pte & PTE_P))
-      panic("copyuvm: page not present");
-    //3.4 - set page as read-only & shared.
-    *pte = *pte & ~PTE_W; 
-    *pte = *pte | PTE_SH; 
+      panic("cowcopyuvm: page not present");
 
     pa = PTE_ADDR(*pte);
-    /*if((mem = kalloc()) == 0)
-      goto bad;*/
-    /*memmove(mem, (char*)p2v(pa), PGSIZE);*/
+    *pte = *pte | PTE_PCOUNT; // 3.4 indicate page belong to counter 
 
-    if((*pte & PTE_W) != 0) {
-        if(mappages(d, (void*)i, PGSIZE, pa, PTE_W|PTE_U) < 0)
-            goto bad;
-    } else {
-        if(mappages(d, (void*)i, PGSIZE, pa, PTE_U) < 0)
-            goto bad;
+	if((*pte & PTE_W) || (*pte & PTE_SHARED)) {
+		if( mappages(d, (void*)i, PGSIZE, pa, PTE_SHARED | PTE_U) < 0 ) // insure page to be read only
+			goto bad;
+		*pte = *pte & ~PTE_W ; 
+        *pte = *pte | PTE_SHARED;
+        
+
+    } else { // page is already read only
+		if(mappages(d, (void*)i, PGSIZE, pa , PTE_RONLY | PTE_U) < 0)
+			goto bad;
     }
+        //////////////////////////////////
+        // updating counter struct with new pointed page
+        acquire(&counterStruct.lock);
+        int *pce = &(counterStruct.pageCounter[pa/PGSIZE]); // Page Counter Enry \m/
+
+            if( (*pce) == 0) {
+                *pce = 2; // first Initialize father and son pointing to page
+            } else {
+                (*pce) = (*pce) + 1;
+            }
+        release(&counterStruct.lock);
+        ///////////////////////////////////
+        
   }
-  return d;
+	asm("movl %cr3,%eax");
+	asm("movl %eax,%cr3");
+    return d;
 
 bad:
   freevm(d);
   return 0;
+}
+
+int
+handler_pgflt() 
+{
+	pte_t *pte ;
+	char* mem;
+	uint pa;
+	void* fault_addr = (void*)rcr2();
+
+    if((pte = walkpgdir(proc->pgdir, (void *) fault_addr , 0)) == 0)
+    	panic("pageFaultHandler: pte should exist");
+
+    if(( (*pte & PTE_RONLY) != 0) ) {
+        panic("try to write to READ ONLY");
+        return 0;
+    }
+
+    if(((*pte & PTE_SHARED) != 0)) { 
+
+		pa = PTE_ADDR(*pte);
+
+        acquire(&counterStruct.lock);
+        int *pce = &(counterStruct.pageCounter[pa/PGSIZE]);
+
+        (*pce) = (*pce) - 1;
+        if((*pce) == 1) {
+            *pte = *pte & ~PTE_SHARED;
+            *pte = *pte | PTE_W;
+        } 
+        release(&counterStruct.lock);
+
+        if((mem = kalloc()) == 0)
+            panic("pageFaultHandler: can't kalloc mem\n");
+
+		memmove(mem, (char*)p2v(pa), PGSIZE);
+
+		*pte = v2p(mem) | PTE_W | PTE_P | PTE_U; 
+
+		asm("movl %cr3,%eax");
+		asm("movl %eax,%cr3");
+
+		return 1;
+
+    } else {
+    	return 0;
+    }
+}
+
+void
+printCounter() 
+{
+    int i; 
+    for(i = 0 ; i < allPhysPageSize ; i++) {
+        if(counterStruct.pageCounter[i] == 0)
+            continue;
+        cprintf("pageCounter[%d] = %d\n",i,counterStruct.pageCounter[i]);
+    }
 }

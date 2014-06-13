@@ -171,13 +171,16 @@ int             allocuvm(pde_t*, uint, uint);
 int             deallocuvm(pde_t*, uint, uint);
 void            freevm(pde_t*);
 void            inituvm(pde_t*, char*, uint);
-int             loaduvm(pde_t*, char*, struct inode*, uint, uint,int);
+int             loaduvm(pde_t*, char*, struct inode*, uint, uint, uint);//
 pde_t*          copyuvm(pde_t*, uint);
 void            switchuvm(struct proc*);
 void            switchkvm(void);
 int             copyout(pde_t*, uint, void*, uint);
 void            clearpteu(pde_t *pgdir, char *uva);
-pde_t*          copyuvm_cowfork(pde_t*, uint); //3.4
+pde_t*			copyuvm_cow(pde_t *pgdir, uint sz); //3.4
+int				handler_pgflt(); //3.4
+int				removePageFromCounter(uint pa,pde_t *pte); //3.4 FIXME pte -> pde
+void            printCounter(); //3.4
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))

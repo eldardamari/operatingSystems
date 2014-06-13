@@ -33,9 +33,8 @@ exec(char *path, char **argv)
     goto bad;
 
   // Load program into memory.
-  //2.1
-  /*sz = 0;*/
-  sz = PGSIZE - 1; //0x1000 exacly 3.2
+  /*sz = 0*/
+  sz = PGSIZE - 1; //3.2
   for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
     if(readi(ip, (char*)&ph, off, sizeof(ph)) != sizeof(ph))
       goto bad;
@@ -45,9 +44,9 @@ exec(char *path, char **argv)
       goto bad;
     if((sz = allocuvm(pgdir, sz, ph.vaddr + ph.memsz)) == 0)
       goto bad;
-    int flagWriteELF = ph.flags & ELF_PROG_FLAG_EXEC;
 
-    if(loaduvm(pgdir,(char*)ph.vaddr, ip, ph.off, ph.filesz,flagWriteELF) < 0)
+    uint flagWriteELF = ph.flags & ELF_PROG_FLAG_WRITE; //3.3
+    if(loaduvm(pgdir, (char*)ph.vaddr, ip, ph.off, ph.filesz,flagWriteELF) < 0)
       goto bad;
   }
   iunlockput(ip);
